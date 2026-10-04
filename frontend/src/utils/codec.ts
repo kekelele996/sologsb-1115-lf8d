@@ -17,33 +17,6 @@ export function isDuplicateCode(code: string, existing: string[]): boolean {
   return existing.some((item) => item.trim().toUpperCase() === code.trim().toUpperCase())
 }
 
-/** 依据已有序号生成下一个流水号 */
-export function nextSerial(siteCode: string, year: number | string, existingCodes: string[]): number {
-  const serials = existingCodes
-    .map((code) => parseSpecimenCode(code))
-    .filter((parsed): parsed is { siteCode: string; year: string; serial: number } => parsed !== null)
-    .filter((parsed) => parsed.siteCode === siteCode.toUpperCase() && parsed.year === String(year))
-    .map((parsed) => parsed.serial)
-  return serials.length > 0 ? Math.max(...serials) + 1 : 1
-}
-
-/** 生成不与已有编号冲突的标本编号 */
-export function allocateSpecimenCode(
-  siteCode: string,
-  year: number | string,
-  existingCodes: string[],
-  reserved: string[] = []
-): string {
-  const used = [...existingCodes, ...reserved]
-  let serial = nextSerial(siteCode, year, used)
-  let code = buildSpecimenCode(siteCode, year, serial)
-  while (isDuplicateCode(code, used)) {
-    serial += 1
-    code = buildSpecimenCode(siteCode, year, serial)
-  }
-  return code
-}
-
 /** 经纬度格式化：116.4042°E, 39.9136°N */
 export function formatLatLng(longitude: number, latitude: number): string {
   const lon = `${Math.abs(longitude).toFixed(4)}°${longitude >= 0 ? 'E' : 'W'}`

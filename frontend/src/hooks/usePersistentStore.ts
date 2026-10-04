@@ -1,22 +1,24 @@
 import { useStore } from 'zustand'
 import type { StoreApi, UseBoundStore } from 'zustand'
 import Dexie, { type Table } from 'dexie'
-import type { CollectSite, Determination, Specimen, Storage } from '@/types'
+import type { CollectSite, Determination, NumberRange, Specimen, Storage } from '@/types'
+import { buildHistoricalRanges } from '@/utils/range'
 
 /** IndexedDB 数据结构版本号 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
 }
 
-/** Dexie 封装：标本 / 采集地 / 保藏位置 / 鉴定记录 四张业务表 + 元数据表 */
+/** Dexie 封装：标本 / 采集地 / 保藏位置 / 鉴定记录 / 号段 五张业务表 + 元数据表 */
 class InsectLogDb extends Dexie {
   specimens!: Table<Specimen, string>
   sites!: Table<CollectSite, string>
   storages!: Table<Storage, string>
   determinations!: Table<Determination, string>
+  numberRanges!: Table<NumberRange, string>
   meta!: Table<MetaRow, string>
 
   constructor() {
@@ -29,7 +31,7 @@ class InsectLogDb extends Dexie {
       meta: 'key'
     })
     // v2：新增「采集方式」字段，迁移时为历史标本补齐默认采集方式（扫网）
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         specimens: 'id, code, order, family, status, siteId, collectDate',
         sites: 'id, code, name, habitat',
@@ -46,6 +48,24 @@ class InsectLogDb extends Dexie {
               specimen.method = '扫网'
             }
           })
+      })
+    // v3：新增「号段台账」表；升级时按存量标本编号把用过的号补成历史段
+    this.version(SCHEMA_VERSION)
+      .stores({
+        specimens: 'id, code, order, family, status, siteId, collectDate',
+        sites: 'id, code, name, habitat',
+        storages: 'id, specimenId, cabinet, drawer',
+        determinations: 'id, specimenId, determiner, date',
+        numberRanges: 'id, siteCode, year, team, status',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        const specimens = await tx.table<Specimen, string>('specimens').toArray()
+        const today = new Date().toISOString().slice(0, 10)
+        const ranges = buildHistoricalRanges(specimens, today)
+        if (ranges.length > 0) {
+          await tx.table<NumberRange, string>('numberRanges').bulkPut(ranges)
+        }
       })
   }
 }
@@ -132,7 +152,7 @@ export async function seedDemoData(): Promise<void> {
     }
   ])
 
-  await db.specimens.bulkPut([
+  const seedSpecimens: Specimen[] = [
     {
       id: 'sp_001',
       code: 'QLB-2026-0001',
@@ -212,6 +232,37 @@ export async function seedDemoData(): Promise<void> {
       determiner: '',
       siteId: 'site_shr',
       note: '酒精浸液保存，待制片'
+    }
+  ]
+
+  await db.specimens.bulkPut(seedSpecimens)
+
+  // 号段台账：存量编号补成历史段；另发两条在用段供野外队本趟领用
+  await db.numberRanges.bulkPut([
+    ...buildHistoricalRanges(seedSpecimens, today, '存量数据补建的历史段'),
+    {
+      id: 'range_qlb_2026',
+      siteCode: 'QLB',
+      year: '2026',
+      startSerial: 3,
+      endSerial: 50,
+      team: '样地调查一队',
+      status: '在用',
+      issuedDate: today,
+      usedSerials: [],
+      note: '春季样地调查领用'
+    },
+    {
+      id: 'range_shr_2026',
+      siteCode: 'SHR',
+      year: '2026',
+      startSerial: 3,
+      endSerial: 20,
+      team: '湿地调查二队',
+      status: '在用',
+      issuedDate: today,
+      usedSerials: [],
+      note: '湿地昆虫调查领用'
     }
   ])
 

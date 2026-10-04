@@ -6,7 +6,9 @@ import SitePicker from '@/components/common/SitePicker'
 import { usePersistentStore } from '@/hooks/usePersistentStore'
 import { specimenStore } from '@/stores/specimenStore'
 import { siteStore } from '@/stores/siteStore'
-import { allocateSpecimenCode, isDuplicateCode } from '@/utils/codec'
+import { numberRangeStore } from '@/stores/numberRangeStore'
+import { isDuplicateCode } from '@/utils/codec'
+import { formatSerial, nextSerialInRange, rangeUsageText } from '@/utils/range'
 import { uid } from '@/utils/id'
 
 interface DraftRow {
@@ -39,14 +41,16 @@ const newDraft = (): DraftRow => ({
   note: ''
 })
 
-/** 采集登记：选择采集地后自动带出生境与小生境，支持一次提交多条同批次标本 */
+/** 采集登记：选择采集地后自动带出生境与小生境，支持一次提交多条同批次标本；编号从本队在用号段内分配 */
 export default function CollectPage(): JSX.Element {
   const sites = usePersistentStore(siteStore, (state) => state.rows)
   const specimens = usePersistentStore(specimenStore, (state) => state.rows)
+  const ranges = usePersistentStore(numberRangeStore, (state) => state.rows)
 
   const [siteId, setSiteId] = useState('')
   const [collectDate, setCollectDate] = useState(new Date().toISOString().slice(0, 10))
   const [collector, setCollector] = useState('')
+  const [team, setTeam] = useState('')
   const [drafts, setDrafts] = useState<DraftRow[]>([newDraft()])
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
@@ -55,19 +59,33 @@ export default function CollectPage(): JSX.Element {
   const site = sites.find((item) => item.id === siteId)
   const year = collectDate.slice(0, 4) || String(new Date().getFullYear())
 
-  /** 每行自动生成互不冲突的标本编号（采集地代码-年份-流水号） */
+  /** 该采集地 + 年份下标本馆已发出、仍在用的号段（野外队从自己领用的段里往下取号） */
+  const activeRanges = useMemo(
+    () =>
+      ranges.filter(
+        (item) => item.siteCode === (site?.code ?? '').toUpperCase() && item.year === year && item.status === '在用'
+      ),
+    [ranges, site?.code, year]
+  )
+  const activeRange = activeRanges.find((item) => item.team === team) ?? activeRanges[0]
+
+  /** 每行从号段内自动分配互不冲突的标本编号（采集地代码-年份-流水号） */
   const codes = useMemo(() => {
-    const existing = specimens.map((item) => item.code)
-    const reserved: string[] = []
+    if (!activeRange) return {}
+    const reserved: number[] = []
     const result: Record<string, string> = {}
     drafts.forEach((draft) => {
-      const code = allocateSpecimenCode(site?.code ?? 'TMP', year, existing, reserved)
-      reserved.push(code)
-      result[draft.id] = code
+      const serial = nextSerialInRange(activeRange, specimens, reserved)
+      if (serial === null) {
+        result[draft.id] = ''
+        return
+      }
+      reserved.push(serial)
+      result[draft.id] = `${activeRange.siteCode}-${activeRange.year}-${formatSerial(serial)}`
     })
     return result
-    // drafts 的字段变化不影响编号分配，仅行数与采集地/年份影响
-  }, [drafts.length, drafts, site?.code, year, specimens])
+    // drafts 的字段变化不影响编号分配，仅行数与采集地/年份/号段影响
+  }, [drafts.length, activeRange, specimens])
 
   const patchDraft = (id: string, patch: Partial<DraftRow>): void => {
     setDrafts((prev) => prev.map((row) => (row.id === id ? { ...row, ...patch } : row)))
@@ -78,11 +96,19 @@ export default function CollectPage(): JSX.Element {
       setError('请先选择采集地（标本编号需要采集地代码）')
       return
     }
+    if (!activeRange) {
+      setError(`该采集地（${site.code}）${year} 年没有在用号段，请先到「号段台账」领段`)
+      return
+    }
     if (drafts.length === 0) {
       setError('至少登记一条标本')
       return
     }
     const codesInBatch = Object.values(codes)
+    if (codesInBatch.some((code) => code === '')) {
+      setError(`号段 ${formatSerial(activeRange.startSerial)}~${formatSerial(activeRange.endSerial)} 已用完，请联系标本馆增发新段`)
+      return
+    }
     const duplicated = codesInBatch.filter((code, index) => codesInBatch.indexOf(code) !== index)
     if (duplicated.length > 0) {
       setError(`批次内编号重复：${duplicated.join('、')}`)
@@ -90,7 +116,7 @@ export default function CollectPage(): JSX.Element {
     }
     const clash = codesInBatch.find((code) => isDuplicateCode(code, specimens.map((item) => item.code)))
     if (clash) {
-      setError(`编号 ${clash} 已存在，请调整采集地或年份`)
+      setError(`编号 ${clash} 已存在，请核对号段用量`)
       return
     }
     if (drafts.some((row) => !row.order.trim())) {
@@ -120,7 +146,9 @@ export default function CollectPage(): JSX.Element {
     }))
     await specimenStore.getState().saveMany(rows)
     setJustCreated(rows)
-    setMessage(`本批次已登记 ${rows.length} 份标本，编号：${rows.map((row) => row.code).join('、')}`)
+    setMessage(
+      `本批次已登记 ${rows.length} 份标本，编号：${rows.map((row) => row.code).join('、')}（本趟用量待回馆后在「号段台账」报回对账）`
+    )
     setDrafts([newDraft()])
   }
 
@@ -129,7 +157,7 @@ export default function CollectPage(): JSX.Element {
       <header>
         <h1 className="page-title">采集登记</h1>
         <p className="page-sub">
-          选择采集地后自动带出生境与小生境；支持一次提交多条同批次标本，编号按「采集地代码-年份-流水号」自动生成并查重。
+          选择采集地后自动带出生境与小生境；支持一次提交多条同批次标本。编号不再按库里最大号接着编，而是从标本馆发给本队的在用号段内往下取，回馆后到「号段台账」报回用量。
         </p>
       </header>
 
@@ -154,6 +182,44 @@ export default function CollectPage(): JSX.Element {
           ) : (
             <p className="mt-3 text-xs text-slate-400">选择采集地后会带出生境与小生境信息</p>
           )}
+
+          {site ? (
+            <div className="mt-3 rounded-lg border border-slate-200 p-3 text-xs">
+              <p className="mb-2 font-medium text-slate-700">本队在用号段（{year}）</p>
+              {activeRanges.length > 0 ? (
+                <div className="flex flex-col gap-2">
+                  {activeRanges.length > 1 ? (
+                    <select
+                      className="field-input"
+                      value={activeRange?.team ?? team}
+                      onChange={(e) => setTeam(e.target.value)}
+                    >
+                      {activeRanges.map((item) => (
+                        <option key={item.id} value={item.team}>
+                          {item.team}（{formatSerial(item.startSerial)}~{formatSerial(item.endSerial)}）
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
+                  {activeRange ? (
+                    <>
+                      <p className="font-mono text-field-700">
+                        {activeRange.siteCode}-{activeRange.year}-{formatSerial(activeRange.startSerial)} ~{' '}
+                        {formatSerial(activeRange.endSerial)}
+                      </p>
+                      <p className="text-slate-500">
+                        领用队：{activeRange.team} · 已用 {rangeUsageText(activeRange, specimens)}（含本趟未报回的采集记录）
+                      </p>
+                    </>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="text-rose-600">
+                  该采集地 {year} 年没有在用号段，请先到「号段台账」领段；编号不得跨段使用。
+                </p>
+              )}
+            </div>
+          ) : null}
         </div>
 
         <div className="panel flex flex-col gap-3">
@@ -179,7 +245,10 @@ export default function CollectPage(): JSX.Element {
             >
               - 减少一条
             </button>
-            <span className="text-xs text-slate-500">本批次 {drafts.length} 条，编号年份 {year}</span>
+            <span className="text-xs text-slate-500">
+              本批次 {drafts.length} 条，编号年份 {year}
+              {activeRange ? `，号段 ${formatSerial(activeRange.startSerial)}~${formatSerial(activeRange.endSerial)}` : '，无在用号段'}
+            </span>
           </div>
 
           <div className="overflow-x-auto">
