@@ -3,10 +3,11 @@ import AppLayout from '@/App'
 import SpecimensPage from '@/pages/SpecimensPage'
 import SitesPage from '@/pages/SitesPage'
 import CollectPage from '@/pages/CollectPage'
+import SegmentsPage from '@/pages/SegmentsPage'
 import DeterminationPage from '@/pages/DeterminationPage'
 import StoragePage from '@/pages/StoragePage'
 
-/** 前端路由：/specimens /collect /sites /determination /storage */
+/** 前端路由：/specimens /collect /segments /sites /determination /storage */
 export function AppRoutes(): JSX.Element {
   return (
     <Routes>
@@ -14,6 +15,7 @@ export function AppRoutes(): JSX.Element {
         <Route index element={<Navigate to="/specimens" replace />} />
         <Route path="/specimens" element={<SpecimensPage />} />
         <Route path="/collect" element={<CollectPage />} />
+        <Route path="/segments" element={<SegmentsPage />} />
         <Route path="/sites" element={<SitesPage />} />
         <Route path="/determination" element={<DeterminationPage />} />
         <Route path="/storage" element={<StoragePage />} />

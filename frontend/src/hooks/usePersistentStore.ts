@@ -1,22 +1,24 @@
 import { useStore } from 'zustand'
 import type { StoreApi, UseBoundStore } from 'zustand'
 import Dexie, { type Table } from 'dexie'
-import type { CollectSite, Determination, Specimen, Storage } from '@/types'
+import type { CollectSite, Determination, NumberSegment, Specimen, Storage } from '@/types'
+import { backfillHistoricalSegments } from '@/utils/segment'
 
 /** IndexedDB 数据结构版本号 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
 }
 
-/** Dexie 封装：标本 / 采集地 / 保藏位置 / 鉴定记录 四张业务表 + 元数据表 */
+/** Dexie 封装：标本 / 采集地 / 保藏位置 / 鉴定记录 / 号段台账 五张业务表 + 元数据表 */
 class InsectLogDb extends Dexie {
   specimens!: Table<Specimen, string>
   sites!: Table<CollectSite, string>
   storages!: Table<Storage, string>
   determinations!: Table<Determination, string>
+  segments!: Table<NumberSegment, string>
   meta!: Table<MetaRow, string>
 
   constructor() {
@@ -29,7 +31,7 @@ class InsectLogDb extends Dexie {
       meta: 'key'
     })
     // v2：新增「采集方式」字段，迁移时为历史标本补齐默认采集方式（扫网）
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         specimens: 'id, code, order, family, status, siteId, collectDate',
         sites: 'id, code, name, habitat',
@@ -46,6 +48,26 @@ class InsectLogDb extends Dexie {
               specimen.method = '扫网'
             }
           })
+      })
+    // v3：新增「号段台账」，迁移时按现有标本编号把用过的号补成历史段
+    this.version(SCHEMA_VERSION)
+      .stores({
+        specimens: 'id, code, order, family, status, siteId, collectDate',
+        sites: 'id, code, name, habitat',
+        storages: 'id, specimenId, cabinet, drawer',
+        determinations: 'id, specimenId, determiner, date',
+        segments: 'id, siteCode, year, status',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        const specimens = await tx.table<Specimen, string>('specimens').toArray()
+        const historical = backfillHistoricalSegments(
+          specimens.map((specimen) => specimen.code),
+          new Date().toISOString().slice(0, 10)
+        )
+        if (historical.length > 0) {
+          await tx.table<NumberSegment, string>('segments').bulkPut(historical)
+        }
       })
   }
 }
@@ -262,4 +284,11 @@ export async function seedDemoData(): Promise<void> {
       handler: '覃羽'
     }
   ])
+
+  // 与升级迁移一致：把示例标本已用的号补成历史段，新发的段从其后接着发
+  const seededCodes = (await db.specimens.toArray()).map((specimen) => specimen.code)
+  const historical = backfillHistoricalSegments(seededCodes, today)
+  if (historical.length > 0) {
+    await db.segments.bulkPut(historical)
+  }
 }

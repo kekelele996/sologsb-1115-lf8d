@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
 import type { CollectMethod, Sex, Specimen, Stage } from '@/types'
 import { COLLECT_METHODS, ORDERS, SEXES, STAGES } from '@/types'
 import SpecimenCard from '@/components/common/SpecimenCard'
@@ -6,7 +7,9 @@ import SitePicker from '@/components/common/SitePicker'
 import { usePersistentStore } from '@/hooks/usePersistentStore'
 import { specimenStore } from '@/stores/specimenStore'
 import { siteStore } from '@/stores/siteStore'
-import { allocateSpecimenCode, isDuplicateCode } from '@/utils/codec'
+import { segmentStore } from '@/stores/segmentStore'
+import { buildSpecimenCode, parseSpecimenCode } from '@/utils/codec'
+import { nextSerialInSegment, segmentRangeText, segmentRemaining } from '@/utils/segment'
 import { uid } from '@/utils/id'
 
 interface DraftRow {
@@ -39,12 +42,14 @@ const newDraft = (): DraftRow => ({
   note: ''
 })
 
-/** 采集登记：选择采集地后自动带出生境与小生境，支持一次提交多条同批次标本 */
+/** 采集登记：从本队领用的号段内取号，提交即向馆里报回这一趟的用量 */
 export default function CollectPage(): JSX.Element {
   const sites = usePersistentStore(siteStore, (state) => state.rows)
   const specimens = usePersistentStore(specimenStore, (state) => state.rows)
+  const segments = usePersistentStore(segmentStore, (state) => state.rows)
 
   const [siteId, setSiteId] = useState('')
+  const [segmentId, setSegmentId] = useState('')
   const [collectDate, setCollectDate] = useState(new Date().toISOString().slice(0, 10))
   const [collector, setCollector] = useState('')
   const [drafts, setDrafts] = useState<DraftRow[]>([newDraft()])
@@ -55,19 +60,51 @@ export default function CollectPage(): JSX.Element {
   const site = sites.find((item) => item.id === siteId)
   const year = collectDate.slice(0, 4) || String(new Date().getFullYear())
 
-  /** 每行自动生成互不冲突的标本编号（采集地代码-年份-流水号） */
+  /** 本队在该采集地+年份手里的在用号段；只有一段时自动选中 */
+  const activeSegments = useMemo(
+    () =>
+      segments.filter(
+        (item) => item.status === '在用' && item.siteCode === (site?.code ?? '') && item.year === year
+      ),
+    [segments, site?.code, year]
+  )
+  const segment =
+    activeSegments.find((item) => item.id === segmentId) ??
+    (activeSegments.length === 1 ? activeSegments[0] : undefined)
+
+  /** 每行从段内往下取号；库中已占但台账未记录的号一并跳过；段用完的行留空 */
   const codes = useMemo(() => {
-    const existing = specimens.map((item) => item.code)
-    const reserved: string[] = []
     const result: Record<string, string> = {}
+    if (!segment) {
+      drafts.forEach((draft) => {
+        result[draft.id] = ''
+      })
+      return result
+    }
+    const extraUsed = specimens
+      .map((item) => parseSpecimenCode(item.code))
+      .filter((parsed): parsed is { siteCode: string; year: string; serial: number } => parsed !== null)
+      .filter(
+        (parsed) =>
+          parsed.siteCode === segment.siteCode &&
+          parsed.year === segment.year &&
+          parsed.serial >= segment.start &&
+          parsed.serial <= segment.end
+      )
+      .map((parsed) => parsed.serial)
+    const reserved: number[] = []
     drafts.forEach((draft) => {
-      const code = allocateSpecimenCode(site?.code ?? 'TMP', year, existing, reserved)
-      reserved.push(code)
-      result[draft.id] = code
+      const serial = nextSerialInSegment(segment, reserved, extraUsed)
+      if (serial === null) {
+        result[draft.id] = ''
+      } else {
+        reserved.push(serial)
+        result[draft.id] = buildSpecimenCode(segment.siteCode, segment.year, serial)
+      }
     })
     return result
-    // drafts 的字段变化不影响编号分配，仅行数与采集地/年份影响
-  }, [drafts.length, drafts, site?.code, year, specimens])
+    // drafts 的字段变化不影响编号分配，仅行数与号段影响
+  }, [drafts, segment, specimens])
 
   const patchDraft = (id: string, patch: Partial<DraftRow>): void => {
     setDrafts((prev) => prev.map((row) => (row.id === id ? { ...row, ...patch } : row)))
@@ -78,19 +115,16 @@ export default function CollectPage(): JSX.Element {
       setError('请先选择采集地（标本编号需要采集地代码）')
       return
     }
+    if (!segment) {
+      setError(`${site.code}-${year} 没有本队在用的号段，请先到「号段台账」领取`)
+      return
+    }
     if (drafts.length === 0) {
       setError('至少登记一条标本')
       return
     }
-    const codesInBatch = Object.values(codes)
-    const duplicated = codesInBatch.filter((code, index) => codesInBatch.indexOf(code) !== index)
-    if (duplicated.length > 0) {
-      setError(`批次内编号重复：${duplicated.join('、')}`)
-      return
-    }
-    const clash = codesInBatch.find((code) => isDuplicateCode(code, specimens.map((item) => item.code)))
-    if (clash) {
-      setError(`编号 ${clash} 已存在，请调整采集地或年份`)
+    if (drafts.some((draft) => !codes[draft.id])) {
+      setError(`本批次超出号段上限（${segmentRangeText(segment)}），请减少条数或到馆里再领一段`)
       return
     }
     if (drafts.some((row) => !row.order.trim())) {
@@ -118,9 +152,19 @@ export default function CollectPage(): JSX.Element {
       siteId: site.id,
       note: draft.note.trim()
     }))
-    await specimenStore.getState().saveMany(rows)
+    // 报回：事务内校验，超上限 / 搭上别队的段 / 撞号都会整批退回，号段台账不跟着动
+    const result = await segmentStore.getState().reportTrip(segment.id, rows)
+    if (!result.ok) {
+      setError(`这一趟报回被退回：${result.error}（号段台账未变动）`)
+      return
+    }
+    await specimenStore.getState().hydrate()
     setJustCreated(rows)
-    setMessage(`本批次已登记 ${rows.length} 份标本，编号：${rows.map((row) => row.code).join('、')}`)
+    setMessage(
+      `本批次已登记 ${rows.length} 份标本并向馆里报回，编号：${rows.map((row) => row.code).join('、')}；段内余量 ${segmentRemaining(
+        segment
+      ) - rows.length} 号`
+    )
     setDrafts([newDraft()])
   }
 
@@ -129,7 +173,7 @@ export default function CollectPage(): JSX.Element {
       <header>
         <h1 className="page-title">采集登记</h1>
         <p className="page-sub">
-          选择采集地后自动带出生境与小生境；支持一次提交多条同批次标本，编号按「采集地代码-年份-流水号」自动生成并查重。
+          编号从本队领用的号段内依次取用，提交即向馆里报回这一趟的用量；超出号段上限或与其他队的段重叠会被整批退回。
         </p>
       </header>
 
@@ -168,6 +212,34 @@ export default function CollectPage(): JSX.Element {
             </div>
           </div>
 
+          <div>
+            <span className="field-label">本趟使用的号段（野外队出发前向馆里领取）</span>
+            {site && activeSegments.length > 0 ? (
+              <select
+                className="field-input"
+                value={segment?.id ?? ''}
+                onChange={(e) => setSegmentId(e.target.value)}
+                data-testid="segment-picker"
+              >
+                {activeSegments.length > 1 ? <option value="">请选择号段</option> : null}
+                {activeSegments.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {segmentRangeText(item)} · {item.team} · 余 {segmentRemaining(item)} 号
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <p className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                {site
+                  ? `${site.code}-${year} 没有在用的号段，请先到「号段台账」领取后再登记`
+                  : '先选择采集地，才能看到可使用的号段'}
+                <Link className="ml-1 font-medium text-field-700 underline" to="/segments">
+                  去号段台账
+                </Link>
+              </p>
+            )}
+          </div>
+
           <div className="flex flex-wrap items-center gap-2">
             <button className="btn-ghost" type="button" onClick={() => setDrafts((prev) => [...prev, newDraft()])}>
               + 增加一条标本
@@ -179,7 +251,10 @@ export default function CollectPage(): JSX.Element {
             >
               - 减少一条
             </button>
-            <span className="text-xs text-slate-500">本批次 {drafts.length} 条，编号年份 {year}</span>
+            <span className="text-xs text-slate-500">
+              本批次 {drafts.length} 条，编号年份 {year}
+              {segment ? `，段内余量 ${segmentRemaining(segment)} 号` : ''}
+            </span>
           </div>
 
           <div className="overflow-x-auto">
@@ -204,7 +279,7 @@ export default function CollectPage(): JSX.Element {
                 {drafts.map((draft) => (
                   <tr key={draft.id}>
                     <td className="border border-slate-200 px-2 py-1 font-mono text-xs text-field-700" data-testid="draft-code">
-                      {codes[draft.id]}
+                      {codes[draft.id] || <span className="font-sans text-rose-500">段内无号可取</span>}
                     </td>
                     <td className="border border-slate-200 px-1 py-1">
                       <select className="field-input" value={draft.order} onChange={(e) => patchDraft(draft.id, { order: e.target.value })}>
